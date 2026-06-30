@@ -10,9 +10,10 @@ import numpy as np
 from sqlite3 import dbapi2 as sqlite3
 from hashlib import md5
 from flask import Flask, request, session, url_for, redirect, \
-     render_template, abort, g, flash, _app_ctx_stack
+     render_template, abort, g, flash
 from flask_limiter import Limiter
-from werkzeug import check_password_hash, generate_password_hash
+from flask_limiter.util import get_remote_address
+from werkzeug.security import check_password_hash, generate_password_hash
 import pymongo
 
 from utils import safe_pickle_dump, strip_version, isvalidid, Config
@@ -27,7 +28,7 @@ else:
   SECRET_KEY = 'devkey, should be in a file'
 app = Flask(__name__)
 app.config.from_object(__name__)
-limiter = Limiter(app, global_limits=["100 per hour", "20 per minute"])
+limiter = Limiter(get_remote_address, app=app, default_limits=["100 per hour", "20 per minute"])
 
 # -----------------------------------------------------------------------------
 # utilities for database interactions 
@@ -194,7 +195,7 @@ def encode_json(ps, n=10, send_images=True, send_abstracts=True):
     struct['originally_published_time'] = '%s/%s/%s' % (timestruct.month, timestruct.day, timestruct.year)
 
     # fetch amount of discussion on this paper
-    struct['num_discussion'] = comments.count({ 'pid': p['_rawid'] })
+    struct['num_discussion'] = comments.count_documents({ 'pid': p['_rawid'] })
 
     # arxiv comments from the authors (when they submit the paper)
     cc = p.get('arxiv_comment', '')
@@ -273,7 +274,7 @@ def discuss():
   # fetch the counts for all tags
   tag_counts = []
   for c in comms:
-    cc = [tags_collection.count({ 'comment_id':c['_id'], 'tag_name':t }) for t in TAGS]
+    cc = [tags_collection.count_documents({ 'comment_id':c['_id'], 'tag_name':t }) for t in TAGS]
     tag_counts.append(cc);
 
   # and render
@@ -686,13 +687,13 @@ if __name__ == "__main__":
   tags_collection = mdb.tags
   goaway_collection = mdb.goaway
   follow_collection = mdb.follow
-  print('mongodb tweets_top1 collection size:', tweets_top1.count())
-  print('mongodb tweets_top7 collection size:', tweets_top7.count())
-  print('mongodb tweets_top30 collection size:', tweets_top30.count())
-  print('mongodb comments collection size:', comments.count())
-  print('mongodb tags collection size:', tags_collection.count())
-  print('mongodb goaway collection size:', goaway_collection.count())
-  print('mongodb follow collection size:', follow_collection.count())
+  print('mongodb tweets_top1 collection size:', tweets_top1.estimated_document_count())
+  print('mongodb tweets_top7 collection size:', tweets_top7.estimated_document_count())
+  print('mongodb tweets_top30 collection size:', tweets_top30.estimated_document_count())
+  print('mongodb comments collection size:', comments.estimated_document_count())
+  print('mongodb tags collection size:', tags_collection.estimated_document_count())
+  print('mongodb goaway collection size:', goaway_collection.estimated_document_count())
+  print('mongodb follow collection size:', follow_collection.estimated_document_count())
   
   TAGS = ['insightful!', 'thank you', 'agree', 'disagree', 'not constructive', 'troll', 'spam']
 
