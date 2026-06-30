@@ -678,7 +678,11 @@ if __name__ == "__main__":
   SEARCH_DICT = cache['search_dict']
 
   print('connecting to mongodb...')
-  client = pymongo.MongoClient()
+  # MONGO_HOST / MONGO_PORT let docker-compose point us at the `mongo` service.
+  # Default preserves the original 2021 behaviour (localhost:27017) for bare runs.
+  mongo_host = os.environ.get('MONGO_HOST', 'localhost')
+  mongo_port = int(os.environ.get('MONGO_PORT', '27017'))
+  client = pymongo.MongoClient(host=mongo_host, port=mongo_port)
   mdb = client.arxiv
   tweets_top1 = mdb.tweets_top1
   tweets_top7 = mdb.tweets_top7

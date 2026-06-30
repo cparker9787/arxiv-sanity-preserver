@@ -1,0 +1,32 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: arxiv-sanity-mongo
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    container_name: arxiv-sanity-app
+    depends_on:
+      mongo:
+        condition: service_healthy
+    ports:
+      - "5000:5000"
+    environment:
+      MONGO_HOST: mongo
+      MONGO_PORT: "27017"
+    volumes:
+      # Persist pickle artifacts and pdfs across container restarts.
+      - ./data:/app/data
+      - app_state:/app/state
+
+volumes:
+  mongo_data:
+  app_state:
