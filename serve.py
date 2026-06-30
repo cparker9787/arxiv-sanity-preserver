@@ -14,9 +14,42 @@ from flask import Flask, request, session, url_for, redirect, \
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.security import check_password_hash, generate_password_hash
-import pymongo
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 from utils import safe_pickle_dump, strip_version, isvalidid, Config
+
+# Postgres connection for the social-feature tables (comments, tags, tweets_top,
+# follow, goaway). Initialized in __main__ from $ARXIV_DATABASE_URL. SQLite
+# (users + library) is untouched — see schema.sql.
+# The migration off MongoDB happened in Phase 0 step 5; see CLAUDE.md for
+# rationale and the schema in schema-postgres.sql.
+pg = None  # global psycopg2 connection (autocommit=True); initialized in main
+
+
+def pg_query(query, args=(), one=False):
+    """Run a SELECT against the Postgres social DB; return list of dict-rows
+    (or a single dict / None when one=True)."""
+    with pg.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(query, args)
+        rv = cur.fetchall()
+        return (rv[0] if rv else None) if one else rv
+
+
+def pg_scalar(query, args=()):
+    """Run a SELECT returning a single scalar (e.g. count(*))."""
+    with pg.cursor() as cur:
+        cur.execute(query, args)
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def pg_exec(query, args=()):
+    """Execute a write (INSERT/UPDATE/DELETE). Returns rowcount."""
+    with pg.cursor() as cur:
+        cur.execute(query, args)
+        return cur.rowcount
+
 
 # various globals
 # -----------------------------------------------------------------------------
@@ -31,7 +64,7 @@ app.config.from_object(__name__)
 limiter = Limiter(get_remote_address, app=app, default_limits=["100 per hour", "20 per minute"])
 
 # -----------------------------------------------------------------------------
-# utilities for database interactions 
+# utilities for database interactions
 # -----------------------------------------------------------------------------
 # to initialize the database: sqlite3 as.db < schema.sql
 def connect_db():
@@ -100,7 +133,7 @@ def papers_similar(pid):
   rawpid = strip_version(pid)
 
   # check if we have this paper at all, otherwise return empty list
-  if not rawpid in db: 
+  if not rawpid in db:
     return []
 
   # check if we have distances to this specific version of paper id (includes version)
@@ -108,7 +141,7 @@ def papers_similar(pid):
     # good, simplest case: lets return the papers
     return [db[strip_version(k)] for k in sim_dict[pid]]
   else:
-    # ok we don't have this specific version. could be a stale URL that points to, 
+    # ok we don't have this specific version. could be a stale URL that points to,
     # e.g. v1 of a paper, but due to an updated version of it we only have v2 on file
     # now. We want to use v2 in that case.
     # lets try to retrieve the most recent version of this paper we do have
@@ -139,7 +172,7 @@ def papers_from_svm(recent_days=None):
     uid = session['user_id']
     if not uid in user_sim:
       return []
-    
+
     # we want to exclude papers that are already in user library from the result, so fetch them.
     user_library = query_db('''select * from library where user_id = ?''', [uid])
     libids = {strip_version(x['paper_id']) for x in user_library}
@@ -155,7 +188,7 @@ def papers_from_svm(recent_days=None):
   return out
 
 def papers_filter_version(papers, v):
-  if v != '1': 
+  if v != '1':
     return papers # noop
   intv = int(v)
   filtered = [p for p in papers if p['_version'] == intv]
@@ -187,7 +220,7 @@ def encode_json(ps, n=10, send_images=True, send_abstracts=True):
     if send_images:
       struct['img'] = '/static/thumbs/' + idvv + '.pdf.jpg'
     struct['tags'] = [t['term'] for t in p['tags']]
-    
+
     # render time information nicely
     timestruct = dateutil.parser.parse(p['updated'])
     struct['published_time'] = '%s/%s/%s' % (timestruct.month, timestruct.day, timestruct.year)
@@ -195,7 +228,8 @@ def encode_json(ps, n=10, send_images=True, send_abstracts=True):
     struct['originally_published_time'] = '%s/%s/%s' % (timestruct.month, timestruct.day, timestruct.year)
 
     # fetch amount of discussion on this paper
-    struct['num_discussion'] = comments.count_documents({ 'pid': p['_rawid'] })
+    # TODO(perf): N+1 query in a per-page loop; Phase 1 batch via WHERE pid IN (...).
+    struct['num_discussion'] = pg_scalar("SELECT count(*) FROM comments WHERE pid = %s", (p['_rawid'],))
 
     # arxiv comments from the authors (when they submit the paper)
     cc = p.get('arxiv_comment', '')
@@ -218,7 +252,7 @@ def default_context(papers, **kws):
   try:
     if Config.beg_for_hosting_money and g.user and uniform(0,1) < 0.05:
       uid = session['user_id']
-      entry = goaway_collection.find_one({ 'uid':uid })
+      entry = pg_query("SELECT 1 FROM goaway WHERE uid = %s", (str(uid),), one=True)
       if not entry:
         lib_count = query_db('''select count(*) from library where user_id = ?''', [uid], one=True)
         lib_count = lib_count['count(*)']
@@ -235,11 +269,12 @@ def default_context(papers, **kws):
 def goaway():
   if not g.user: return # weird
   uid = session['user_id']
-  entry = goaway_collection.find_one({ 'uid':uid })
+  entry = pg_query("SELECT 1 FROM goaway WHERE uid = %s", (str(uid),), one=True)
   if not entry: # ok record this user wanting it to stop
     username = get_username(session['user_id'])
     print('adding', uid, username, 'to goaway.')
-    goaway_collection.insert_one({ 'uid':uid, 'time':int(time.time()) })
+    pg_exec("INSERT INTO goaway (uid, time_posted) VALUES (%s, %s) ON CONFLICT (uid) DO NOTHING",
+            (str(uid), time.time()))
   return 'OK'
 
 @app.route("/")
@@ -265,17 +300,24 @@ def discuss():
   pid = request.args.get('id', '') # paper id of paper we wish to discuss
   papers = [db[pid]] if pid in db else []
 
-  # fetch the comments
-  comms_cursor = comments.find({ 'pid':pid }).sort([('time_posted', pymongo.DESCENDING)])
-  comms = list(comms_cursor)
+  # fetch the comments (newest first)
+  comms = pg_query(
+    "SELECT id, username, pid, version, conf, anon, time_posted, text "
+    "FROM comments WHERE pid = %s ORDER BY time_posted DESC", (pid,))
+  # templates expect _id (string) — preserve the wire shape from the Mongo era
   for c in comms:
-    c['_id'] = str(c['_id']) # have to convert these to strs from ObjectId, and backwards later http://api.mongodb.com/python/current/tutorial.html
+    c['_id'] = str(c['id'])
 
   # fetch the counts for all tags
   tag_counts = []
   for c in comms:
-    cc = [tags_collection.count_documents({ 'comment_id':c['_id'], 'tag_name':t }) for t in TAGS]
-    tag_counts.append(cc);
+    cc = [
+      pg_scalar(
+        "SELECT count(*) FROM tags WHERE comment_id = %s AND tag_name = %s",
+        (int(c['id']), t))
+      for t in TAGS
+    ]
+    tag_counts.append(cc)
 
   # and render
   ctx = default_context(papers, render_format='default', comments=comms, gpid=pid, tags=TAGS, tag_counts=tag_counts)
@@ -302,30 +344,24 @@ def comment():
     return 'bad pid. This is most likely Andrej\'s fault.'
 
   # create the entry
-  entry = {
-    'user': username,
-    'pid': pid, # raw pid with no version, for search convenience
-    'version': version, # version as int, again as convenience
-    'conf': request.form['conf'],
-    'anon': anon,
-    'time_posted': time.time(),
-    'text': request.form['text'],
-  }
-
-  # enter into database
-  print(entry)
-  comments.insert_one(entry)
+  print({'user': username, 'pid': pid, 'version': version})
+  pg_exec(
+    "INSERT INTO comments (username, pid, version, conf, anon, time_posted, text) "
+    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+    (username, pid, int(version), request.form['conf'], bool(anon),
+     time.time(), request.form['text']))
   return 'OK'
 
 @app.route("/discussions", methods=['GET'])
 def discussions():
-  # return most recently discussed papers
-  comms_cursor = comments.find().sort([('time_posted', pymongo.DESCENDING)]).limit(100)
+  # return most recently discussed papers (cap 100)
+  comms = pg_query(
+    "SELECT pid FROM comments ORDER BY time_posted DESC LIMIT 100")
 
   # get the (unique) set of papers.
   papers = []
   have = set()
-  for e in comms_cursor:
+  for e in comms:
     pid = e['pid']
     if pid in db and not pid in have:
       have.add(pid)
@@ -337,7 +373,7 @@ def discussions():
 @app.route('/toggletag', methods=['POST'])
 def toggletag():
 
-  if not g.user: 
+  if not g.user:
     return 'You have to be logged in to tag. Sorry - otherwise things could get out of hand FAST.'
 
   # get the tag and validate it as an allowed tag
@@ -347,25 +383,25 @@ def toggletag():
     return "Bad tag name. This is most likely Andrej's fault."
 
   pid = request.form['pid']
-  comment_id = request.form['comment_id']
+  try:
+    comment_id = int(request.form['comment_id'])
+  except (TypeError, ValueError):
+    return "Bad comment_id."
   username = get_username(session['user_id'])
   time_toggled = time.time()
-  entry = {
-    'username': username,
-    'pid': pid,
-    'comment_id': comment_id,
-    'tag_name': tag_name,
-    'time': time_toggled,
-  }
 
   # remove any existing entries for this user/comment/tag
-  result = tags_collection.delete_one({ 'username':username, 'comment_id':comment_id, 'tag_name':tag_name })
-  if result.deleted_count > 0:
+  deleted = pg_exec(
+    "DELETE FROM tags WHERE username = %s AND comment_id = %s AND tag_name = %s",
+    (username, comment_id, tag_name))
+  if deleted > 0:
     print('cleared an existing entry from database')
   else:
-    print('no entry existed, so this is a toggle ON. inserting:')
-    print(entry)
-    tags_collection.insert_one(entry)
+    print('no entry existed, so this is a toggle ON. inserting tag.')
+    pg_exec(
+      "INSERT INTO tags (username, pid, comment_id, tag_name, time_toggled) "
+      "VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+      (username, pid, comment_id, tag_name, time_toggled))
 
   return 'OK'
 
@@ -406,15 +442,21 @@ def top():
 
 @app.route('/toptwtr', methods=['GET'])
 def toptwtr():
-  """ return top papers """
+  """ return top papers by twitter mentions in a time window """
   ttstr = request.args.get('timefilter', 'day') # default is day
-  tweets_top = {'day':tweets_top1, 'week':tweets_top7, 'month':tweets_top30}[ttstr]
-  cursor = tweets_top.find().sort([('vote', pymongo.DESCENDING)]).limit(100)
+  # map UI param to the schema-postgres.sql `time_window` column
+  twindow = {'day': 'day', 'week': 'week', 'month': 'month'}.get(ttstr, 'day')
+  rows = pg_query(
+    "SELECT pid, vote, data FROM tweets_top WHERE time_window = %s "
+    "ORDER BY vote DESC LIMIT 100", (twindow,))
   papers, tweets = [], []
-  for rec in cursor:
+  for rec in rows:
     if rec['pid'] in db:
       papers.append(db[rec['pid']])
-      tweet = {k:v for k,v in rec.items() if k != '_id'}
+      # preserve the original wire shape: merge top-level pid/vote with `data` jsonb
+      tweet = dict(rec.get('data') or {})
+      tweet['pid'] = rec['pid']
+      tweet['vote'] = rec['vote']
       tweets.append(tweet)
   ctx = default_context(papers, render_format='toptwtr', tweets=tweets,
                         msg='Top papers mentioned on Twitter over last ' + ttstr + ':')
@@ -435,7 +477,7 @@ def library():
 @app.route('/libtoggle', methods=['POST'])
 def review():
   """ user wants to toggle a paper in his library """
-  
+
   # make sure user is logged in
   if not g.user:
     return 'NO' # fail... (not logged in). JS should prevent from us getting here.
@@ -474,7 +516,7 @@ def review():
 
 @app.route('/friends', methods=['GET'])
 def friends():
-    
+
     ttstr = request.args.get('timefilter', 'week') # default is week
     legend = {'day':1, '3days':3, 'week':7, 'month':30, 'year':365}
     tt = legend.get(ttstr, 7)
@@ -484,7 +526,7 @@ def friends():
     if g.user:
         # gather all the people we are following
         username = get_username(session['user_id'])
-        edges = list(follow_collection.find({ 'who':username }))
+        edges = pg_query("SELECT whom FROM follow WHERE who = %s", (username,))
         # fetch all papers in all of their libraries, and count the top ones
         counts = {}
         for edict in edges:
@@ -528,14 +570,16 @@ def account():
     # fetch all followers/following of the logged in user
     if g.user:
         username = get_username(session['user_id'])
-        
-        following_db = list(follow_collection.find({ 'who':username }))
-        for e in following_db:
-            following.append({ 'user':e['whom'], 'active':e['active'] })
 
-        followers_db = list(follow_collection.find({ 'whom':username }))
+        following_db = pg_query(
+          "SELECT whom, active FROM follow WHERE who = %s", (username,))
+        for e in following_db:
+            following.append({ 'user':e['whom'], 'active':bool(e['active']) })
+
+        followers_db = pg_query(
+          "SELECT who, active FROM follow WHERE whom = %s", (username,))
         for e in followers_db:
-            followers.append({ 'user':e['who'], 'active':e['active'] })
+            followers.append({ 'user':e['who'], 'active':bool(e['active']) })
 
     ctx['followers'] = followers
     ctx['following'] = following
@@ -550,10 +594,11 @@ def requestfollow():
         # make sure whom exists in our database
         whom_id = get_user_id(whom)
         if whom_id is not None:
-            e = { 'who':who, 'whom':whom, 'active':0, 'time_request':int(time.time()) }
-            print('adding request follow:')
-            print(e)
-            follow_collection.insert_one(e)
+            print('adding request follow:', who, '->', whom)
+            pg_exec(
+              "INSERT INTO follow (who, whom, active, time_request) "
+              "VALUES (%s, %s, FALSE, %s) ON CONFLICT (who, whom) DO NOTHING",
+              (who, whom, time.time()))
 
     return redirect(url_for('account'))
 
@@ -574,9 +619,8 @@ def removefollow():
         else:
             return 'NOTOK'
 
-        delq = { 'who':who, 'whom':whom }
-        print('deleting from follow collection:', delq)
-        follow_collection.delete_one(delq)
+        print('deleting from follow:', who, '->', whom)
+        pg_exec("DELETE FROM follow WHERE who = %s AND whom = %s", (who, whom))
         return 'OK'
     else:
         return 'NOTOK'
@@ -591,17 +635,17 @@ def addfollow():
             # user clicked "OK" in the followers list, wants to approve some follower. make active.
             who = user
             whom = username
-            delq = { 'who':who, 'whom':whom }
-            print('making active in follow collection:', delq)
-            follow_collection.update_one(delq, {'$set':{'active':1}})
+            print('making active in follow:', who, '->', whom)
+            pg_exec("UPDATE follow SET active = TRUE WHERE who = %s AND whom = %s",
+                    (who, whom))
             return 'OK'
-        
+
     return 'NOTOK'
 
 @app.route('/login', methods=['POST'])
 def login():
   """ logs in the user. if the username doesn't exist creates the account """
-  
+
   if not request.form['username']:
     flash('You have to enter a username')
   elif not request.form['password']:
@@ -621,15 +665,15 @@ def login():
     # create account and log in
     creation_time = int(time.time())
     g.db.execute('''insert into user (username, pw_hash, creation_time) values (?, ?, ?)''',
-      [request.form['username'], 
-      generate_password_hash(request.form['password']), 
+      [request.form['username'],
+      generate_password_hash(request.form['password']),
       creation_time])
     user_id = g.db.execute('select last_insert_rowid()').fetchall()[0][0]
     g.db.commit()
 
     session['user_id'] = user_id
     flash('New account %s created' % (request.form['username'], ))
-  
+
   return redirect(url_for('intmain'))
 
 @app.route('/logout')
@@ -642,7 +686,7 @@ def logout():
 # int main
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-   
+
   parser = argparse.ArgumentParser()
   parser.add_argument('-p', '--prod', dest='prod', action='store_true', help='run in prod?')
   parser.add_argument('-r', '--num_results', dest='num_results', type=int, default=200, help='number of results to return per query')
@@ -653,11 +697,13 @@ if __name__ == "__main__":
   if not os.path.isfile(Config.database_path):
     print('did not find as.db, trying to create an empty database from schema.sql...')
     print('this needs sqlite3 to be installed!')
+    # os.system: invokes local sqlite3 with a controlled path. See CLAUDE.md
+    # "Security context". Phase 1 will replace with subprocess.run([...]).
     os.system('sqlite3 as.db < schema.sql')
 
   print('loading the paper database', Config.db_serve_path)
   db = pickle.load(open(Config.db_serve_path, 'rb'))
-  
+
   print('loading tfidf_meta', Config.meta_path)
   meta = pickle.load(open(Config.meta_path, "rb"))
   vocab = meta['vocab']
@@ -670,35 +716,27 @@ if __name__ == "__main__":
   user_sim = {}
   if os.path.isfile(Config.user_sim_path):
     user_sim = pickle.load(open(Config.user_sim_path, 'rb'))
-  
+
   print('loading serve cache...', Config.serve_cache_path)
   cache = pickle.load(open(Config.serve_cache_path, "rb"))
   DATE_SORTED_PIDS = cache['date_sorted_pids']
   TOP_SORTED_PIDS = cache['top_sorted_pids']
   SEARCH_DICT = cache['search_dict']
 
-  print('connecting to mongodb...')
-  # MONGO_HOST / MONGO_PORT let docker-compose point us at the `mongo` service.
-  # Default preserves the original 2021 behaviour (localhost:27017) for bare runs.
-  mongo_host = os.environ.get('MONGO_HOST', 'localhost')
-  mongo_port = int(os.environ.get('MONGO_PORT', '27017'))
-  client = pymongo.MongoClient(host=mongo_host, port=mongo_port)
-  mdb = client.arxiv
-  tweets_top1 = mdb.tweets_top1
-  tweets_top7 = mdb.tweets_top7
-  tweets_top30 = mdb.tweets_top30
-  comments = mdb.comments
-  tags_collection = mdb.tags
-  goaway_collection = mdb.goaway
-  follow_collection = mdb.follow
-  print('mongodb tweets_top1 collection size:', tweets_top1.estimated_document_count())
-  print('mongodb tweets_top7 collection size:', tweets_top7.estimated_document_count())
-  print('mongodb tweets_top30 collection size:', tweets_top30.estimated_document_count())
-  print('mongodb comments collection size:', comments.estimated_document_count())
-  print('mongodb tags collection size:', tags_collection.estimated_document_count())
-  print('mongodb goaway collection size:', goaway_collection.estimated_document_count())
-  print('mongodb follow collection size:', follow_collection.estimated_document_count())
-  
+  print('connecting to postgres (social tables)...')
+  # ARXIV_DATABASE_URL points at the link-kb Postgres instance, database
+  # `arxiv_sanity`. The default works for the docker-compose stack in this repo.
+  arxiv_dsn = os.environ.get(
+    'ARXIV_DATABASE_URL',
+    'postgresql://arxiv:arxiv@localhost:5433/arxiv_sanity')
+  pg = psycopg2.connect(arxiv_dsn)
+  pg.autocommit = True  # simpler than commit() at every write site
+  for tbl in ('comments', 'tags', 'tweets_top', 'follow', 'goaway'):
+    try:
+      print(f'postgres {tbl} count:', pg_scalar(f"SELECT count(*) FROM {tbl}"))
+    except Exception as e:
+      print(f'postgres {tbl}: {e}')
+
   TAGS = ['insightful!', 'thank you', 'agree', 'disagree', 'not constructive', 'troll', 'spam']
 
   # start

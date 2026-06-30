@@ -21,7 +21,8 @@ werkzeug>=3.0,<4          # NOTE: security helpers moved — see serve.py edit
 tornado>=6.4,<7
 
 # Database
-pymongo>=4.6,<5           # NOTE: .count() removed in 4.x — see serve.py edits
+psycopg2-binary>=2.9,<3   # Phase 0 step 5: moved off MongoDB to Postgres
+                          # (binary wheel keeps the requirements light; no libpq build needed)
 
 # python-twitter (original 2021 dep) is unmaintained — twitter_daemon.py is left
 # as-is for now; modernization will replace it with tweepy or an X MCP bridge.

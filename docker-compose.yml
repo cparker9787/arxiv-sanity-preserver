@@ -1,32 +1,42 @@
 services:
-  mongo:
-    image: mongo:7
-    container_name: arxiv-sanity-mongo
+  # Postgres for social-feature tables (comments, tags, tweets_top, follow,
+  # goaway). In the real deployment this collapses into the openclaw link-kb
+  # Postgres instance — one server, two databases. For standalone local dev
+  # we ship a pgvector image to stay schema-compatible with that future.
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: arxiv-sanity-db
     restart: unless-stopped
+    environment:
+      POSTGRES_USER: arxiv
+      POSTGRES_PASSWORD: arxiv
+      POSTGRES_DB: arxiv_sanity
+    ports:
+      - "5433:5432"   # host:5433 so we don't collide with a host Postgres on 5432
     volumes:
-      - mongo_data:/data/db
+      - db_data:/var/lib/postgresql/data
+      - ./schema-postgres.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
     healthcheck:
-      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand('ping').ok"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      test: ["CMD-SHELL", "pg_isready -U arxiv -d arxiv_sanity"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   app:
     build: .
     container_name: arxiv-sanity-app
     depends_on:
-      mongo:
+      db:
         condition: service_healthy
     ports:
       - "5000:5000"
     environment:
-      MONGO_HOST: mongo
-      MONGO_PORT: "27017"
+      ARXIV_DATABASE_URL: postgresql://arxiv:arxiv@db:5432/arxiv_sanity
     volumes:
       # Persist pickle artifacts and pdfs across container restarts.
       - ./data:/app/data
       - app_state:/app/state
 
 volumes:
-  mongo_data:
+  db_data:
   app_state:

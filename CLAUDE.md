@@ -57,6 +57,36 @@ already in the 2021 code and a safe rewrite is real work, not a pin/import fix:
   refactor to `subprocess.run([...])`** with explicit arg lists for defense
   in depth.
 
+### Step 5: MongoDB → Postgres (Phase 0)
+
+The original 2021 code used MongoDB for five social-feature collections:
+`comments`, `tags`, `tweets_top1`/`7`/`30`, `follow`, `goaway`. For a personal
+deployment running alongside the openclaw `link-kb` Postgres instance, running
+two database servers was operational overhead with no upside. All five moved
+to Postgres in one schema (`schema-postgres.sql`):
+
+| Mongo collection | Postgres table | Note |
+|---|---|---|
+| `comments` | `comments` | `BIGSERIAL id`; `time_posted` stays unix-seconds float |
+| `tags` | `tags` | FK on `comment_id` with `ON DELETE CASCADE` + UNIQUE `(username, comment_id, tag_name)` |
+| `tweets_top1` / `_top7` / `_top30` | `tweets_top` | one table; `time_window IN ('day','week','month')` (column not named `window` because that's a Postgres reserved word) |
+| `follow` | `follow` | PK `(who, whom)`; `active` is BOOLEAN |
+| `goaway` | `goaway` | PK on `uid` |
+
+`serve.py` uses `psycopg2` directly with three small helpers (`pg_query`,
+`pg_scalar`, `pg_exec`) and the connection on `pg.autocommit = True`. The
+templates' `_id` field on comments is preserved as `str(int)` for compatibility.
+
+**Connection**: `ARXIV_DATABASE_URL` env var (default
+`postgresql://arxiv:arxiv@localhost:5433/arxiv_sanity`). `docker-compose.yml`
+runs a `pgvector/pgvector:pg16` `db` service that loads `schema-postgres.sql`
+on first start.
+
+**SQLite is still in play.** The `user` + `library` tables stay on SQLite
+(`as.db` from `schema.sql`). Consolidating those into Postgres is Phase 1
+(low risk, the same `pg_*` helpers handle it). `twitter_daemon.py` is also
+out of scope for Phase 0 (`python-twitter` is unmaintained).
+
 ### Out of scope for Phase 0 (left as-is, flagged for later)
 
 - `python-twitter` is unmaintained; `twitter_daemon.py` will fail on first run. Will be replaced with `tweepy` or wired to an X MCP bridge in Phase 2.
