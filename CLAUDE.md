@@ -37,6 +37,26 @@ All in `serve.py`. Fixed in this commit:
 | `TypeError: Limiter.__init__() got an unexpected keyword argument 'global_limits'` | flask-limiter 2.x+ rewrote init API | `Limiter(get_remote_address, app=app, default_limits=[...])` |
 | `AttributeError: 'Collection' object has no attribute 'count'` | pymongo 4.x removed `Collection.count()` | `Collection.count_documents({...})` or `estimated_document_count()` for unfiltered counts |
 
+### Security context (Phase 0 trust boundary)
+
+This codebase predates the modern Python security guidance and uses `pickle`
+and `os.system` heavily. **Both are kept as-is for Phase 0** because they were
+already in the 2021 code and a safe rewrite is real work, not a pin/import fix:
+
+- **Pickle (`pickle.load`)** in `analyze.py`, `buildsvm.py`, `download_pdfs.py`,
+  `make_cache.py`, `serve.py`: the pickle files (`db.p`, `tfidf.p`, `sim_dict.p`,
+  `db2.p`, `serve_cache.p`, `user_sim.p`, `tfidf_meta.p`, `user_sim.p`) are
+  **produced by this codebase's own pipeline scripts** via `utils.safe_pickle_dump`.
+  Trust boundary: an attacker with write access to the working directory can
+  already run arbitrary code. **Phase 1 will replace** with joblib for sparse
+  matrices and JSON for non-matrix data, plus integrity hashing.
+- **`os.system`** in `thumb_pdf.py`, `parse_pdf_to_text.py`, `make_cache.py`,
+  `download_pdfs.py`: invokes known local utilities (`mv`, `cp`, `pdftotext`,
+  `montage`, `convert`). Inputs are filenames sourced from arXiv's API
+  (already validated as arXiv ids via `utils.isvalidid`). **Phase 1 will
+  refactor to `subprocess.run([...])`** with explicit arg lists for defense
+  in depth.
+
 ### Out of scope for Phase 0 (left as-is, flagged for later)
 
 - `python-twitter` is unmaintained; `twitter_daemon.py` will fail on first run. Will be replaced with `tweepy` or wired to an X MCP bridge in Phase 2.
