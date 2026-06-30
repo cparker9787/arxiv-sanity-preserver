@@ -1,0 +1,16 @@
+.git
+.github
+.venv
+venv
+__pycache__
+.pytest_cache
+*.pyc
+data/pdf
+data/txt
+static/thumbs
+tmp
+as.db
+secret_key.txt
+banned.txt
+*.p
+.DS_Store

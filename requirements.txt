@@ -1,18 +1,28 @@
-# feedparser is only if you want to scrape arxiv
-feedparser
-numpy
-scipy
+# arxiv-sanity-preserver — pinned for Python 3.11+ (2026 modernization).
+# Original 2021 deps were unpinned; many had breaking API changes since.
+# See CLAUDE.md for the modernization plan and known code edits.
 
-# sciki-learn is only for sparse arrays
-scikit-learn
+# Scraping / data
+feedparser>=6.0,<7
 
-# twitter
-python-twitter
-pytz
+# Numerical / ML
+numpy>=1.26,<3
+scipy>=1.11,<2
+scikit-learn>=1.4,<2
 
-# the following are only for serve.py
-python-dateutil
-flask
-flask_limiter
-tornado
-pymongo
+# Time / dates
+pytz>=2024.1
+python-dateutil>=2.9
+
+# Web stack (serve.py)
+flask>=3.0,<4
+flask-limiter>=3.5,<4     # NOTE: API changed in 2.x — see serve.py edit
+werkzeug>=3.0,<4          # NOTE: security helpers moved — see serve.py edit
+tornado>=6.4,<7
+
+# Database
+psycopg2-binary>=2.9,<3   # Phase 0 step 5: moved off MongoDB to Postgres
+                          # (binary wheel keeps the requirements light; no libpq build needed)
+
+# python-twitter (original 2021 dep) is unmaintained — twitter_daemon.py is left
+# as-is for now; modernization will replace it with tweepy or an X MCP bridge.

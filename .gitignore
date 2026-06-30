@@ -10,3 +10,11 @@ env/
 data
 *.DS_Store
 twitter.txt
+
+# Phase 0 modernization additions
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+banned.txt
